@@ -1,0 +1,1852 @@
+<?php
+// webhook.cluesstyle.com/webhook.php
+error_reporting(E_ALL);
+ini_set('display_errors', 0);
+ini_set('log_errors', 1);
+ini_set('error_log', __DIR__ . '/error.log');
+
+// ─── PHPMailer via Composer ───────────────────────────────────────────────────
+require __DIR__ . '/vendor/autoload.php';
+
+use PHPMailer\PHPMailer\PHPMailer;
+use PHPMailer\PHPMailer\SMTP;
+use PHPMailer\PHPMailer\Exception;
+// ─────────────────────────────────────────────────────────────────────────────
+
+if (file_exists(__DIR__ . '/db.php')) {
+    include __DIR__ . '/db.php';
+} else {
+    $conn = null;
+}
+
+header("Access-Control-Allow-Origin: *");
+header("Access-Control-Allow-Methods: GET, POST, OPTIONS");
+header("Access-Control-Allow-Headers: Content-Type, Authorization");
+header("Content-Type: application/json");
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(200);
+    exit();
+}
+
+// ─── WhatsApp API Credentials ─────────────────────────────────────────────────
+$VERIFY_TOKEN = "cluesstyle";
+$TOKEN        = "EAAhdmX6OdMEBRIJpAtvJgBMO4sUbt2setp3DtoYtzqPY5SkUTy2MqSQG9WOSKsmIlZCwv6ZBtQd9xwWx5eljn5HmxE51i4WnK2Rmg4MpcNYF1qWw8VMQ3UVTiwm5gSEoestw5Cay3tBOU03kddvt88PQnxtYWYJKwPsTem3oziZAIM7hH6lpCB1UdoTVgZDZD";
+$PHONE_ID     = "1102700929584978";
+$WABA_ID      = "1465694725259422";
+// ─────────────────────────────────────────────────────────────────────────────
+
+$NOTIFY_EMAIL = "cluesstylenew@gmail.com";
+
+define('SMTP_FROM_EMAIL', 'mayurg78600@gmail.com');
+define('SMTP_FROM_NAME',  'Cluesstyle Bot');
+define('SMTP_PASSWORD',   'hgae tctg zqph xlve');
+define('SMTP_HOST',       'smtp.gmail.com');
+define('SMTP_PORT',       587);
+
+$UPLOAD_DIR      = __DIR__ . "/uploads/";
+$UPLOAD_BASE_URL = "https://webhook.cluesstyle.com/uploads";
+
+foreach (['images', 'videos', 'audio', 'documents', 'stickers'] as $folder) {
+    $path = $UPLOAD_DIR . $folder;
+    if (!file_exists($path)) {
+        mkdir($path, 0755, true);
+    }
+}
+
+// =============================================================================
+// ENSURE META FLOW SUBMISSIONS TABLE EXISTS
+// =============================================================================
+function ensureMetaFlowSubmissionsTable($conn) {
+    if (!$conn || $conn->connect_error) return;
+    $conn->query("
+        CREATE TABLE IF NOT EXISTS `meta_flow_submissions` (
+            `id`            INT AUTO_INCREMENT PRIMARY KEY,
+            `phone`         VARCHAR(30)  NOT NULL DEFAULT '',
+            `flow_token`    VARCHAR(255) NOT NULL DEFAULT '',
+            `template_name` VARCHAR(255) NOT NULL DEFAULT '',
+            `flow_data`     JSON,
+            `raw_response`  TEXT,
+            `submitted_at`  DATETIME NOT NULL,
+            INDEX `idx_phone`        (`phone`),
+            INDEX `idx_submitted_at` (`submitted_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ");
+}
+
+// =============================================================================
+// SAVE META FLOW SUBMISSION TO DB
+// =============================================================================
+function saveMetaFlowSubmission($conn, $phone, $flowToken, $templateName, $flowData, $rawResponse) {
+    if (!$conn || $conn->connect_error) return false;
+
+    ensureMetaFlowSubmissionsTable($conn);
+
+    $flowDataJson = is_array($flowData) ? json_encode($flowData, JSON_UNESCAPED_UNICODE) : $flowData;
+
+    $stmt = $conn->prepare(
+        "INSERT INTO `meta_flow_submissions`
+         (phone, flow_token, template_name, flow_data, raw_response, submitted_at)
+         VALUES (?, ?, ?, ?, ?, NOW())"
+    );
+    if (!$stmt) {
+        error_log("saveMetaFlowSubmission prepare failed: " . $conn->error);
+        return false;
+    }
+    $stmt->bind_param("sssss", $phone, $flowToken, $templateName, $flowDataJson, $rawResponse);
+    $result = $stmt->execute();
+    $stmt->close();
+
+    error_log("[$phone] Meta Flow submission saved to DB. Token: $flowToken | Template: $templateName");
+    return $result;
+}
+
+// =============================================================================
+// ROUTE: GET
+// =============================================================================
+if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+    if (isset($_GET['hub_verify_token']) && $_GET['hub_verify_token'] === $VERIFY_TOKEN) {
+        echo $_GET['hub_challenge'];
+        exit;
+    }
+
+    if (isset($_GET['action']) && $_GET['action'] === 'get_templates') {
+        $templates = fetchTemplatesFromMeta(
+            $GLOBALS['TOKEN'],
+            $GLOBALS['WABA_ID'],
+            $_GET['language'] ?? null,
+            $_GET['category'] ?? null,
+            $_GET['status']   ?? 'APPROVED',
+            intval($_GET['limit'] ?? 20)
+        );
+
+        if ($conn && !$conn->connect_error && !empty($templates['data'])) {
+            syncTemplatesToDB($conn, $templates['data']);
+        }
+
+        header("Content-Type: application/json");
+        echo json_encode($templates, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    // ── GET: View Meta Flow Submissions ──────────────────────────────────────
+    if (isset($_GET['action']) && $_GET['action'] === 'get_flow_submissions') {
+        ensureMetaFlowSubmissionsTable($conn);
+        $phone  = $_GET['phone']  ?? null;
+        $limit  = intval($_GET['limit']  ?? 50);
+        $offset = intval($_GET['offset'] ?? 0);
+
+        $sql   = "SELECT * FROM `meta_flow_submissions`";
+        $args  = [];
+        $types = '';
+
+        if ($phone) {
+            $sql   .= " WHERE phone = ?";
+            $args[] = $phone;
+            $types .= 's';
+        }
+
+        $sql    .= " ORDER BY submitted_at DESC LIMIT ? OFFSET ?";
+        $args[]  = $limit;
+        $args[]  = $offset;
+        $types  .= 'ii';
+
+        $stmt = $conn->prepare($sql);
+        if ($types) $stmt->bind_param($types, ...$args);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        $rows   = [];
+        while ($row = $result->fetch_assoc()) {
+            $row['flow_data'] = json_decode($row['flow_data'], true);
+            $rows[] = $row;
+        }
+        $stmt->close();
+
+        header("Content-Type: application/json");
+        echo json_encode(['data' => $rows, 'total' => count($rows)], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    echo json_encode(["error" => "Verification failed or unknown action"]);
+    exit;
+}
+
+// =============================================================================
+// ROUTE: POST — Incoming WhatsApp messages
+// =============================================================================
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $input = file_get_contents("php://input");
+    file_put_contents("log.txt", $input . "\n", FILE_APPEND);
+
+    $data    = json_decode($input, true);
+    $message = $data['entry'][0]['changes'][0]['value']['messages'][0] ?? null;
+
+    if ($message) {
+        $from               = $message['from'];
+        $type               = $message['type'];
+        $content            = '';
+        $buttonResponse     = '';
+        $buttonId           = '';
+        $replyToMessageId   = null;
+        $replyToMessageText = null;
+
+        $media_id        = '';
+        $media_url       = '';
+        $local_file_path = '';
+        $file_size       = 0;
+        $mime_type       = '';
+
+        $reaction_emoji      = '';
+        $reaction_message_id = '';
+
+        // ── Reply/quote context ───────────────────────────────────────────────
+        if (isset($message['context']['id'])) {
+            $replyToMessageId = $message['context']['id'];
+
+            if ($conn && !$conn->connect_error) {
+                $stmt = $conn->prepare(
+                    "SELECT message FROM `messages-new` WHERE message_id = ? LIMIT 1"
+                );
+                $stmt->bind_param("s", $replyToMessageId);
+                $stmt->execute();
+                $result = $stmt->get_result();
+                if ($result->num_rows > 0) {
+                    $replyToMessageText = $result->fetch_assoc()['message'];
+                }
+                $stmt->close();
+            }
+            error_log("[$from] replied to msg $replyToMessageId: $replyToMessageText");
+        }
+
+        // ── Message type switch ───────────────────────────────────────────────
+        switch ($type) {
+            case 'text':
+                $content = trim($message['text']['body'] ?? '');
+                break;
+
+            case 'image':
+                $media_id  = $message['image']['id'] ?? '';
+                $content   = trim($message['image']['caption'] ?? '');
+                $mime_type = $message['image']['mime_type'] ?? 'image/jpeg';
+                $saved = downloadAndSaveMedia($media_id, $TOKEN, 'image', $mime_type);
+                if ($saved) {
+                    $local_file_path = $saved['local_path'];
+                    $media_url       = $saved['public_url'];
+                    $file_size       = $saved['file_size'];
+                    $mime_type       = $saved['mime_type'];
+                }
+                break;
+
+            case 'video':
+                $media_id  = $message['video']['id'] ?? '';
+                $content   = trim($message['video']['caption'] ?? '');
+                $mime_type = $message['video']['mime_type'] ?? 'video/mp4';
+                $saved = downloadAndSaveMedia($media_id, $TOKEN, 'video', $mime_type);
+                if ($saved) {
+                    $local_file_path = $saved['local_path'];
+                    $media_url       = $saved['public_url'];
+                    $file_size       = $saved['file_size'];
+                    $mime_type       = $saved['mime_type'];
+                }
+                break;
+
+            case 'audio':
+                $media_id  = $message['audio']['id'] ?? '';
+                $mime_type = $message['audio']['mime_type'] ?? 'audio/ogg';
+                $saved = downloadAndSaveMedia($media_id, $TOKEN, 'audio', $mime_type);
+                if ($saved) {
+                    $local_file_path = $saved['local_path'];
+                    $media_url       = $saved['public_url'];
+                    $file_size       = $saved['file_size'];
+                    $mime_type       = $saved['mime_type'];
+                }
+                break;
+
+            case 'document':
+                $media_id  = $message['document']['id'] ?? '';
+                $content   = $message['document']['filename'] ?? '';
+                $mime_type = $message['document']['mime_type'] ?? 'application/octet-stream';
+                $saved = downloadAndSaveMedia($media_id, $TOKEN, 'document', $mime_type, $content);
+                if ($saved) {
+                    $local_file_path = $saved['local_path'];
+                    $media_url       = $saved['public_url'];
+                    $file_size       = $saved['file_size'];
+                    $mime_type       = $saved['mime_type'];
+                }
+                break;
+
+            case 'sticker':
+                $media_id    = $message['sticker']['id'] ?? '';
+                $mime_type   = $message['sticker']['mime_type'] ?? 'image/webp';
+                $is_animated = !empty($message['sticker']['animated']);
+                $content     = $is_animated ? 'animated_sticker' : 'static_sticker';
+                $saved = downloadAndSaveMedia($media_id, $TOKEN, 'sticker', $mime_type);
+                if ($saved) {
+                    $local_file_path = $saved['local_path'];
+                    $media_url       = $saved['public_url'];
+                    $file_size       = $saved['file_size'];
+                    $mime_type       = $saved['mime_type'];
+                }
+                error_log("[$from] sticker (" . ($is_animated ? 'animated' : 'static') . "): $media_url");
+                break;
+
+            case 'reaction':
+                $reaction_emoji      = $message['reaction']['emoji'] ?? '';
+                $reaction_message_id = $message['reaction']['message_id'] ?? '';
+                $content             = $reaction_emoji;
+                error_log("[$from] reacted '$reaction_emoji' to msg $reaction_message_id");
+                break;
+
+            case 'button':
+                $buttonResponse = $message['button']['payload'] ?? $message['button']['text'] ?? '';
+                $content        = $message['button']['text'] ?? $message['button']['payload'] ?? '';
+                $buttonId       = $message['button']['id'] ?? '';
+                break;
+
+            case 'order':
+                $order      = $message['order'] ?? [];
+                $catalog_id = $order['catalog_id'] ?? '';
+                $products   = $order['product_items'] ?? [];
+
+                $lines = [];
+                $total = 0;
+                foreach ($products as $item) {
+                    $qty      = $item['quantity'] ?? 1;
+                    $price    = $item['item_price'] ?? 0;
+                    $currency = $item['currency'] ?? 'INR';
+                    $sku      = $item['product_retailer_id'] ?? '';
+                    $subtotal = $qty * $price;
+                    $total   += $subtotal;
+                    $lines[]  = "• {$sku} x{$qty} @ {$price} {$currency} = {$subtotal}";
+                }
+
+                $content = "ORDER:\n" . implode("\n", $lines) . "\nTotal: {$total} INR";
+                error_log("[$from] Order received: $content");
+
+                $emailBody = "🛒 New Catalogue Order from +{$from}\n\n"
+                           . "Catalog ID: {$catalog_id}\n\n"
+                           . implode("\n", $lines)
+                           . "\n\nTotal: {$total} INR\n\n"
+                           . "Reply on WhatsApp: https://wa.me/{$from}";
+                sendEmailNotification($GLOBALS['NOTIFY_EMAIL'], "🛒 New Order – Cluesstyle", $emailBody);
+                break;
+
+            default:
+                if (isset($message['interactive'])) {
+                    $interactive = $message['interactive'];
+
+                    if ($interactive['type'] === 'button_reply') {
+                        $buttonResponse = $interactive['button_reply']['id'] ?? '';
+                        $content        = $interactive['button_reply']['title'] ?? '';
+                        $buttonId       = $interactive['button_reply']['id'] ?? '';
+
+                    } elseif ($interactive['type'] === 'list_reply') {
+                        $buttonResponse = $interactive['list_reply']['id'] ?? '';
+                        $content        = $interactive['list_reply']['title'] ?? '';
+                        $buttonId       = $interactive['list_reply']['id'] ?? '';
+
+                    // ══════════════════════════════════════════════════════════
+                    // META FLOW (nfm_reply) HANDLER
+                    // Triggered when a user completes a Meta Flow form attached
+                    // to a WhatsApp template button
+                    // ══════════════════════════════════════════════════════════
+                    } elseif ($interactive['type'] === 'nfm_reply') {
+
+                        $flowResponseRaw  = $interactive['nfm_reply']['response_json'] ?? '{}';
+                        $flowResponseData = json_decode($flowResponseRaw, true) ?? [];
+                        $flowToken        = $flowResponseData['flow_token'] ?? '';
+
+                        // Pull existing session to detect template name + carry vars
+                        $existingSession = getUserSession($conn, $from);
+                        $templateName    = $existingSession['pending_template'] ?? 'unknown';
+
+                        error_log("[$from] ✅ Meta Flow completed. Token: $flowToken | Template: $templateName | Data: " . json_encode($flowResponseData));
+
+                        // ── 1. Save submission to meta_flow_submissions table ──
+                        saveMetaFlowSubmission(
+                            $conn,
+                            $from,
+                            $flowToken,
+                            $templateName,
+                            $flowResponseData,
+                            $flowResponseRaw
+                        );
+
+                        // ── 2. Merge all flow fields into session variables ────
+                        $existingVars = $existingSession['variables'] ?? [];
+
+                        foreach ($flowResponseData as $key => $value) {
+                            if (is_string($value) || is_numeric($value)) {
+                                $existingVars['meta_flow_' . $key] = (string)$value;
+                            }
+                        }
+                        $existingVars['meta_flow_token']     = $flowToken;
+                        $existingVars['meta_flow_completed'] = 'yes';
+                        $existingVars['meta_flow_raw']       = $flowResponseRaw;
+                        $existingVars['meta_flow_template']  = $templateName;
+
+                        error_log("[$from] Meta Flow variables stored: " . json_encode($existingVars));
+
+                        // ── 3. Log nfm_reply as incoming message in messages-new ─
+                        if ($conn && !$conn->connect_error) {
+                            $flowLines = [];
+							$fieldLabels = [
+								'flow_token' => null, // skip internal fields
+							];
+							foreach ($flowResponseData as $key => $value) {
+								if ($key === 'flow_token') continue;
+								$label = ucwords(str_replace(['_', '-'], ' ', $key));
+								$flowLines[] = "{$label}: {$value}";
+							}
+							$flowSummary = "📋 *Order Form Response*\n" . implode("\n", $flowLines);
+                            $stmt = $conn->prepare(
+                                "INSERT INTO `messages-new`
+                                 (phone, message, type, direction, message_id,
+                                  reply_to_id, reply_to_message,
+                                  media_id, media_url, local_file_path, file_size, mime_type,
+                                  reaction_emoji, reaction_message_id,
+                                  created_at)
+                                 VALUES (?, ?, 'interactive', 'incoming', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())"
+                            );
+                            $emptyStr = '';
+                            $zeroInt  = 0;
+                            $stmt->bind_param(
+                                "sssssssssiiss",
+                                $from, $flowSummary, $message['id'],
+                                $replyToMessageId, $replyToMessageText,
+                                $emptyStr, $emptyStr, $emptyStr, $zeroInt, $emptyStr,
+                                $emptyStr, $emptyStr
+                            );
+                            $stmt->execute();
+                            $stmt->close();
+                        }
+
+                        // ── 4a. If user is already in a bot flow, continue it ──
+                        if ($existingSession && !empty($existingSession['current_flow_id'])) {
+                            updateUserSession($conn, $from, 'in_flow', array_merge(
+                                $existingSession,
+                                ['variables' => $existingVars]
+                            ));
+
+                            processWithVisualFlow(
+                                $conn, $from, 'flow_completed', 'flow_completed',
+                                $replyToMessageId, $replyToMessageText
+                            );
+
+                        // ── 4b. No active flow session — try trigger keyword ───
+                        } else {
+                            updateUserSession($conn, $from, 'meta_flow_pending', [
+                                'current_flow_id'   => null,
+                                'current_node_id'   => null,
+                                'flow_data'         => null,
+                                'variables'         => $existingVars,
+                                'awaiting_button'   => false,
+                                'awaiting_question' => false,
+                                'question_node_id'  => null,
+                                'last_message_id'   => null,
+                            ]);
+
+                            $triggeredFlow = getFlowByTriggerKeyword($conn, 'flow_completed');
+                            if ($triggeredFlow) {
+                                startFlow($conn, $from, $triggeredFlow['id'], 'flow_completed');
+                            } else {
+                                // No flow configured — send default thank-you
+                                sendAndLog(
+                                    $conn, $from,
+                                    "✅ *Thank you!* We've received your details successfully.\n\n"
+                                    . "Our team will review your submission and get back to you shortly.\n\n"
+                                    . "⏰ *Working hours:* Mon–Sat, 10 AM – 7 PM\n\n"
+                                    . "💡 Type *support* to reach our team or *#* to restart."
+                                );
+                                clearUserSession($conn, $from);
+                            }
+                        }
+
+                        // ── 5. Email team with form data ──────────────────────
+                        $emailRows = [];
+                        foreach ($flowResponseData as $key => $value) {
+                            if ($key === 'flow_token') continue;
+                            $emailRows[] = ucfirst(str_replace('_', ' ', $key)) . ": " . $value;
+                        }
+                        $emailBody = "📋 Meta Flow Submission from +{$from}\n\n"
+                                   . "Template : {$templateName}\n"
+                                   . "Flow Token: {$flowToken}\n"
+                                   . "Time: " . date('d M Y, h:i A') . "\n\n"
+                                   . "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                   . implode("\n", $emailRows) . "\n"
+                                   . "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                                   . "Reply on WhatsApp: https://wa.me/{$from}";
+                        sendEmailNotification(
+                            $GLOBALS['NOTIFY_EMAIL'],
+                            "📋 Meta Flow Submission – Cluesstyle ({$templateName})",
+                            $emailBody
+                        );
+
+                        echo json_encode(["status" => "success"]);
+                        exit;
+                    }
+                    // ══════════════════════════════════════════════════════════
+                }
+                break;
+        }
+
+        // ── Persist incoming message ──────────────────────────────────────────
+        // Skip nfm_reply — already logged above inside the elseif block
+        if ($conn && !$conn->connect_error && $type !== 'interactive') {
+            $stmt = $conn->prepare(
+                "INSERT INTO `messages-new`
+                 (phone, message, type, direction, message_id,
+                  reply_to_id, reply_to_message,
+                  media_id, media_url, local_file_path, file_size, mime_type,
+                  reaction_emoji, reaction_message_id,
+                  created_at)
+                 VALUES (?, ?, ?, 'incoming', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())"
+            );
+            $stmt->bind_param(
+                "sssssssssiiss",
+                $from, $content, $type, $message['id'],
+                $replyToMessageId, $replyToMessageText,
+                $media_id, $media_url, $local_file_path, $file_size, $mime_type,
+                $reaction_emoji, $reaction_message_id
+            );
+            $stmt->execute();
+            $stmt->close();
+
+            if ($type === 'reaction' && !empty($reaction_message_id)) {
+                $stmt2 = $conn->prepare(
+                    "UPDATE `messages-new`
+                     SET last_reaction = ?, last_reaction_by = ?, last_reaction_at = NOW()
+                     WHERE message_id = ? LIMIT 1"
+                );
+                $stmt2->bind_param("sss", $reaction_emoji, $from, $reaction_message_id);
+                $stmt2->execute();
+                $stmt2->close();
+            }
+        } elseif ($conn && !$conn->connect_error && $type === 'interactive') {
+            // button_reply / list_reply (NOT nfm_reply — that exited above)
+            $stmt = $conn->prepare(
+                "INSERT INTO `messages-new`
+                 (phone, message, type, direction, message_id,
+                  reply_to_id, reply_to_message,
+                  media_id, media_url, local_file_path, file_size, mime_type,
+                  reaction_emoji, reaction_message_id,
+                  created_at)
+                 VALUES (?, ?, ?, 'incoming', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())"
+            );
+            $emptyStr = '';
+            $zeroInt  = 0;
+            $stmt->bind_param(
+                "sssssssssiiss",
+                $from, $content, $type, $message['id'],
+                $replyToMessageId, $replyToMessageText,
+                $emptyStr, $emptyStr, $emptyStr, $zeroInt, $emptyStr,
+                $emptyStr, $emptyStr
+            );
+            $stmt->execute();
+            $stmt->close();
+        }
+
+        // ── Pass to bot (skip reactions and stickers) ─────────────────────────
+        if ($type !== 'reaction' && $type !== 'sticker') {
+            $userInput = !empty($buttonResponse) ? $buttonResponse : $content;
+
+            processWithVisualFlow(
+                $conn, $from, $userInput, $buttonId,
+                $replyToMessageId, $replyToMessageText
+            );
+        }
+    }
+
+    echo json_encode(["status" => "success"]);
+    exit;
+}
+
+// =============================================================================
+// TEMPLATE API FUNCTIONS
+// =============================================================================
+
+function fetchTemplatesFromMeta($token, $wabaId, $language = null, $category = null, $status = null, $limit = 200) {
+    $params = [
+        'fields' => 'id,name,language,status,category,components,rejected_reason',
+        'limit'  => min($limit, 200),
+    ];
+
+    if ($category) $params['category'] = strtoupper($category);
+    if ($language) $params['language'] = $language;
+
+    $url          = "https://graph.facebook.com/v21.0/{$wabaId}/message_templates?" . http_build_query($params);
+    $allTemplates = [];
+    $page         = 0;
+
+    while ($url && $page < 10) {
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_HTTPHEADER,     ["Authorization: Bearer $token"]);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT,        30);
+        $response  = curl_exec($ch);
+        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($http_code !== 200) {
+            error_log("Template API HTTP $http_code: $response");
+            break;
+        }
+
+        $decoded = json_decode($response, true);
+
+        if (!empty($decoded['error'])) {
+            error_log("Template API error: " . json_encode($decoded['error']));
+            break;
+        }
+
+        if (!empty($decoded['data'])) {
+            $allTemplates = array_merge($allTemplates, $decoded['data']);
+        }
+
+        $url = $decoded['paging']['next'] ?? null;
+        $page++;
+    }
+
+    // Filter by status locally
+    if ($status) {
+        $statusUpper  = strtoupper($status);
+        $allTemplates = array_filter($allTemplates, function($t) use ($statusUpper) {
+            return strtoupper($t['status'] ?? '') === $statusUpper;
+        });
+        $allTemplates = array_values($allTemplates);
+    }
+
+    $grouped = [];
+    foreach ($allTemplates as $t) {
+        $cat = $t['category'] ?? 'UNKNOWN';
+        $grouped[$cat][] = $t;
+    }
+
+    error_log("fetchTemplatesFromMeta: fetched " . count($allTemplates) . " templates.");
+
+    return [
+        'data'    => $allTemplates,
+        'total'   => count($allTemplates),
+        'grouped' => $grouped,
+    ];
+}
+
+function syncTemplatesToDB($conn, array $templates) {
+    $conn->query("
+        CREATE TABLE IF NOT EXISTS `bot_templates` (
+            `id`              INT AUTO_INCREMENT PRIMARY KEY,
+            `template_id`     VARCHAR(64)  NOT NULL DEFAULT '',
+            `name`            VARCHAR(255) NOT NULL DEFAULT '',
+            `language`        VARCHAR(20)  NOT NULL DEFAULT '',
+            `status`          VARCHAR(30)  NOT NULL DEFAULT '',
+            `category`        VARCHAR(50)  NOT NULL DEFAULT '',
+            `components`      JSON,
+            `quality_score`   JSON,
+            `rejected_reason` TEXT,
+            `synced_at`       DATETIME     NOT NULL,
+            UNIQUE KEY `uniq_template` (`name`, `language`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ");
+
+    $stmt = $conn->prepare(
+        "INSERT INTO `bot_templates`
+         (template_id, name, language, status, category, components, quality_score, rejected_reason, synced_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())
+         ON DUPLICATE KEY UPDATE
+           template_id     = VALUES(template_id),
+           status          = VALUES(status),
+           category        = VALUES(category),
+           components      = VALUES(components),
+           quality_score   = VALUES(quality_score),
+           rejected_reason = VALUES(rejected_reason),
+           synced_at       = NOW()"
+    );
+
+    $synced = 0;
+    foreach ($templates as $tpl) {
+        $tpl_id          = $tpl['id'] ?? '';
+        $name            = $tpl['name'] ?? '';
+        $language        = $tpl['language'] ?? '';
+        $status          = $tpl['status'] ?? '';
+        $category        = $tpl['category'] ?? '';
+        $components      = json_encode($tpl['components'] ?? []);
+        $quality_score   = json_encode($tpl['quality_score'] ?? []);
+        $rejected_reason = $tpl['rejected_reason'] ?? null;
+
+        $stmt->bind_param(
+            "ssssssss",
+            $tpl_id, $name, $language, $status, $category,
+            $components, $quality_score, $rejected_reason
+        );
+        if ($stmt->execute()) $synced++;
+    }
+    $stmt->close();
+    error_log("syncTemplatesToDB: synced $synced / " . count($templates) . " templates.");
+}
+
+// =============================================================================
+// MEDIA FUNCTIONS
+// =============================================================================
+
+function downloadAndSaveMedia($media_id, $token, $type, $mime_type, $filename = '') {
+    if (!$media_id) return null;
+
+    global $UPLOAD_DIR, $UPLOAD_BASE_URL;
+
+    try {
+        $ch = curl_init("https://graph.facebook.com/v18.0/{$media_id}");
+        curl_setopt($ch, CURLOPT_HTTPHEADER,     ["Authorization: Bearer $token"]);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT,        15);
+        $response  = curl_exec($ch);
+        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($http_code !== 200) {
+            error_log("Media info failed for $media_id HTTP $http_code");
+            return null;
+        }
+
+        $download_url = json_decode($response, true)['url'] ?? null;
+        if (!$download_url) return null;
+
+        $ch = curl_init($download_url);
+        curl_setopt($ch, CURLOPT_HTTPHEADER,     ["Authorization: Bearer $token"]);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_TIMEOUT,        60);
+        $file_content = curl_exec($ch);
+        $http_code    = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($http_code !== 200 || empty($file_content)) return null;
+
+        $folderMap = [
+            'image'    => 'images',
+            'video'    => 'videos',
+            'audio'    => 'audio',
+            'document' => 'documents',
+            'sticker'  => 'stickers',
+        ];
+        $folder = $folderMap[$type] ?? 'documents';
+
+        $extension = getExtensionFromMimeType($mime_type);
+        $unique_id = uniqid() . '_' . time();
+        $file_name = ($filename && $type === 'document')
+            ? $unique_id . '_' . preg_replace('/[^a-zA-Z0-9.-]/', '_', $filename)
+            : $unique_id . '.' . $extension;
+
+        $local_path = $UPLOAD_DIR . $folder . '/' . $file_name;
+        $public_url = $UPLOAD_BASE_URL . '/' . $folder . '/' . $file_name;
+
+        if (file_put_contents($local_path, $file_content) !== false) {
+            error_log("Media saved: $local_path");
+            return [
+                'local_path' => "/uploads/{$folder}/{$file_name}",
+                'public_url' => $public_url,
+                'file_size'  => strlen($file_content),
+                'mime_type'  => $mime_type,
+            ];
+        }
+
+        error_log("Failed to write: $local_path");
+        return null;
+
+    } catch (Exception $e) {
+        error_log("downloadAndSaveMedia: " . $e->getMessage());
+        return null;
+    }
+}
+
+function getExtensionFromMimeType($mime_type) {
+    $map = [
+        'image/jpeg'       => 'jpg',
+        'image/jpg'        => 'jpg',
+        'image/png'        => 'png',
+        'image/gif'        => 'gif',
+        'image/webp'       => 'webp',
+        'video/mp4'        => 'mp4',
+        'video/mpeg'       => 'mpg',
+        'video/quicktime'  => 'mov',
+        'audio/mpeg'       => 'mp3',
+        'audio/mp3'        => 'mp3',
+        'audio/ogg'        => 'ogg',
+        'audio/wav'        => 'wav',
+        'application/pdf'  => 'pdf',
+        'application/msword'                                                       => 'doc',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'  => 'docx',
+        'application/vnd.ms-excel'                                                 => 'xls',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'        => 'xlsx',
+        'text/plain'       => 'txt',
+    ];
+    return $map[$mime_type] ?? 'bin';
+}
+
+// =============================================================================
+// SMART USER INPUT MATCHING
+// =============================================================================
+
+function matchUserInputSmart($userInput, $conditionValue) {
+    $userInput      = strtolower(trim($userInput));
+    $conditionValue = strtolower(trim($conditionValue));
+
+    if ($userInput === $conditionValue) return true;
+
+    $userInputClean = preg_replace('/[^a-z0-9]/', '', $userInput);
+    $conditionClean = preg_replace('/[^a-z0-9]/', '', $conditionValue);
+    if ($userInputClean === $conditionClean) return true;
+
+    if (strpos($userInput, $conditionValue) !== false) return true;
+
+    $numberMap = [
+        '1' => ['1', 'one'],
+        '2' => ['2', 'two'],
+        '3' => ['3', 'three'],
+        '4' => ['4', 'four'],
+        '5' => ['5', 'five'],
+    ];
+    foreach ($numberMap as $num => $variations) {
+        if (in_array($userInput, $variations) && in_array($conditionValue, $variations)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// =============================================================================
+// EMAIL NOTIFICATION — PHPMailer SMTP
+// =============================================================================
+
+function sendEmailNotification($to, $subject, $body) {
+    $mail = new PHPMailer(true);
+
+    try {
+        $mail->isSMTP();
+        $mail->Host       = SMTP_HOST;
+        $mail->SMTPAuth   = true;
+        $mail->Username   = SMTP_FROM_EMAIL;
+        $mail->Password   = SMTP_PASSWORD;
+        $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
+        $mail->Port       = SMTP_PORT;
+        $mail->CharSet    = 'UTF-8';
+
+        $mail->setFrom(SMTP_FROM_EMAIL, SMTP_FROM_NAME);
+        $mail->addAddress($to);
+
+        $mail->isHTML(false);
+        $mail->Subject = $subject;
+        $mail->Body    = $body;
+
+        $mail->send();
+        error_log("sendEmailNotification → $to | Subject: $subject | Sent: YES");
+        return true;
+
+    } catch (\Exception $e) {
+        error_log("sendEmailNotification FAILED → $to | Error: " . $mail->ErrorInfo);
+        return false;
+    }
+}
+
+// =============================================================================
+// SEND HELPERS — with DB logging
+// =============================================================================
+
+function sendAndLog($conn, $phone, $message) {
+    sendWhatsAppMessage($phone, $message, $GLOBALS['TOKEN'], $GLOBALS['PHONE_ID']);
+
+    if ($conn && !$conn->connect_error) {
+        $stmt = $conn->prepare(
+            "INSERT INTO `messages-new`
+             (phone, message, type, direction, status, created_at)
+             VALUES (?, ?, 'text', 'outgoing', 'sent', NOW())"
+        );
+        $stmt->bind_param("ss", $phone, $message);
+        $stmt->execute();
+        $stmt->close();
+    }
+}
+
+// =============================================================================
+// CATCH-ALL UNKNOWN MESSAGE HANDLER
+// =============================================================================
+
+function handleUnknownMessage($conn, $phone, $userInput) {
+    global $TOKEN, $PHONE_ID, $NOTIFY_EMAIL;
+
+    $userInputLower = strtolower(trim($userInput));
+
+    if ($userInputLower === 'team') {
+        error_log("[$phone] Chose TEAM option from catch-all handler");
+
+        $emailSubject = "🆕 New WhatsApp Support Request – Cluesstyle";
+        $emailBody    = "Hello Team,\n\n"
+                      . "A customer has requested to speak with a support agent via WhatsApp.\n\n"
+                      . "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                      . "📱 Customer Phone : +$phone\n"
+                      . "💬 Last Message   : $userInput\n"
+                      . "🕐 Time           : " . date('d M Y, h:i A') . "\n"
+                      . "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                      . "👉 Reply directly on WhatsApp:\n"
+                      . "https://wa.me/$phone\n\n"
+                      . "Please follow up as soon as possible.\n\n"
+                      . "– Cluesstyle Bot System";
+
+        $emailSent = sendEmailNotification($NOTIFY_EMAIL, $emailSubject, $emailBody);
+        error_log("[$phone] Team email to $NOTIFY_EMAIL: " . ($emailSent ? "✅ sent" : "❌ failed"));
+
+        if ($conn && !$conn->connect_error) {
+            $stmt = $conn->prepare(
+                "INSERT INTO `messages-new`
+                 (phone, message, type, direction, status, created_at)
+                 VALUES (?, '[TEAM CONNECT REQUEST]', 'text', 'outgoing', 'sent', NOW())"
+            );
+            $stmt->bind_param("s", $phone);
+            $stmt->execute();
+            $stmt->close();
+        }
+
+        $reply = "✅ *Sure!* I have forwarded your message to our team.\n\n"
+               . "👥 Our support team will get back to you shortly on WhatsApp.\n\n"
+               . "⏰ *Working hours:* Mon–Sat, 10 AM – 7 PM\n\n"
+               . "💡 *Other commands:*\n"
+               . "• Type *support* – Get contact details\n"
+               . "• Type *#* – Restart conversation\n"
+               . "• Type *hi* – Start bot menu again";
+
+        sendAndLog($conn, $phone, $reply);
+        return;
+    }
+
+    if ($userInputLower === 'continue') {
+        error_log("[$phone] Chose CONTINUE option from catch-all handler");
+
+        $reply = "🤖 *Great! Let's get started.*\n\n"
+               . "I'm here to assist you with your requirements! 😊\n\n"
+               . "Please type *hi* or *hello* to open the main menu.\n\n"
+               . "💡 *Commands:*\n"
+               . "• Type *support* – Contact our support team\n"
+               . "• Type *#* – Restart conversation";
+
+        sendAndLog($conn, $phone, $reply);
+        return;
+    }
+
+    error_log("[$phone] Unknown message (no trigger, no session): '$userInput' → Showing catch-all intro");
+
+    $intro = "👋 *Hello! I'm Bot Assistance from Cluesstyle.*\n\n"
+           . "I noticed you sent a message. I'm here to help! 😊\n\n"
+           . "How would you like to proceed?\n\n"
+           . "🤖 Type *continue* – I'll collect your requirements\n"
+           . "👥 Type *team* – Connect with our support team\n\n";
+
+    sendAndLog($conn, $phone, $intro);
+}
+
+// =============================================================================
+// VISUAL FLOW BOT ENGINE
+// =============================================================================
+
+function processWithVisualFlow($conn, $phone, $userInput, $buttonId = '', $replyToId = null, $replyToText = null) {
+    $tempSession = getUserSession($conn, $phone);
+    if (checkForSpecialCommands($conn, $phone, $userInput, $tempSession)) {
+        return;
+    }
+
+    $session = getUserSession($conn, $phone);
+
+    if ($session && !empty($session['current_flow_id'])) {
+        processFlowNode(
+            $conn, $phone,
+            $session['current_flow_id'], $session['current_node_id'],
+            $userInput, $session, $buttonId, $replyToId, $replyToText
+        );
+        return;
+    }
+
+    $triggeredFlow = getFlowByTriggerKeyword($conn, $userInput);
+    if ($triggeredFlow && !empty($triggeredFlow['id'])) {
+        startFlow($conn, $phone, $triggeredFlow['id'], $userInput);
+        return;
+    }
+
+    handleUnknownMessage($conn, $phone, $userInput);
+}
+
+// =============================================================================
+// SPECIAL COMMANDS HANDLER
+// =============================================================================
+
+function checkForSpecialCommands($conn, $phone, $userInput, &$session) {
+    $userInputLower = strtolower(trim($userInput));
+
+    if ($userInputLower === 'support' || $userInputLower === 'help') {
+        error_log("[$phone] Triggered SUPPORT command");
+        clearUserSession($conn, $phone);
+
+        $supportMessage = "📞 *Need Help?*\n\n"
+                        . "Our support team is here to assist you!\n\n"
+                        . "📱 *Call us:* +919004363902\n"
+                        . "💬 *WhatsApp:* wa.me/919004363902\n"
+                        . "📧 *Email:* support@cluesstyle.com\n\n"
+                        . "Our team will respond within 24 hours.\n\n"
+                        . "Type *#* to restart the conversation or ask your question again.";
+
+        sendAndLog($conn, $phone, $supportMessage);
+        return true;
+    }
+
+    if ($userInputLower === '#') {
+        error_log("[$phone] Triggered RESTART command");
+        clearUserSession($conn, $phone);
+
+        $restartMessage = "🔄 *Restarting Conversation*\n\n"
+                        . "Let's start from the beginning!\n\n"
+                        . "Type *hello* or *hi* to begin the conversation again.\n\n"
+                        . "Thank you for your patience! 😊";
+
+        sendAndLog($conn, $phone, $restartMessage);
+        return true;
+    }
+
+    return false;
+}
+
+// =============================================================================
+// SESSION FUNCTIONS
+// =============================================================================
+
+function getUserSession($conn, $phone) {
+    if (!$conn || $conn->connect_error) return null;
+
+    $stmt = $conn->prepare("SELECT * FROM user_sessions WHERE phone = ?");
+    if (!$stmt) return null;
+    $stmt->bind_param("s", $phone);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    if ($result->num_rows > 0) {
+        $row = $result->fetch_assoc();
+        $stmt->close();
+        $d = json_decode($row['data'], true) ?? [];
+
+        error_log("Session loaded for $phone - Flow: {$d['current_flow_id']}, Node: {$d['current_node_id']}, Awaiting: " . ($d['awaiting_button'] ? 'Button' : ($d['awaiting_question'] ? 'Question' : 'None')) . ", Vars: " . count($d['variables'] ?? []));
+
+        return [
+            'phone'             => $row['phone'],
+            'state'             => $row['state'],
+            'current_flow_id'   => $d['current_flow_id'] ?? null,
+            'current_node_id'   => $d['current_node_id'] ?? null,
+            'flow_data'         => $d['flow_data'] ?? null,
+            'variables'         => $d['variables'] ?? [],
+            'awaiting_button'   => $d['awaiting_button'] ?? false,
+            'awaiting_question' => $d['awaiting_question'] ?? false,
+            'question_node_id'  => $d['question_node_id'] ?? null,
+            'last_message_id'   => $d['last_message_id'] ?? null,
+            'pending_template'  => $d['pending_template'] ?? null,
+        ];
+    }
+    $stmt->close();
+    return null;
+}
+
+function updateUserSession($conn, $phone, $state, $data = null) {
+    if (!$conn || $conn->connect_error) return false;
+
+    $jsonData  = json_encode($data);
+    $checkStmt = $conn->prepare("SELECT id FROM user_sessions WHERE phone = ?");
+    $checkStmt->bind_param("s", $phone);
+    $checkStmt->execute();
+    $exists = $checkStmt->get_result()->num_rows > 0;
+    $checkStmt->close();
+
+    if ($exists) {
+        $stmt = $conn->prepare(
+            "UPDATE user_sessions SET state = ?, data = ?, updated_at = NOW() WHERE phone = ?"
+        );
+        if (!$stmt) return false;
+        $stmt->bind_param("sss", $state, $jsonData, $phone);
+    } else {
+        $stmt = $conn->prepare(
+            "INSERT INTO user_sessions (phone, state, data, created_at, updated_at) VALUES (?, ?, ?, NOW(), NOW())"
+        );
+        if (!$stmt) return false;
+        $stmt->bind_param("sss", $phone, $state, $jsonData);
+    }
+    $result = $stmt->execute();
+    $stmt->close();
+
+    error_log("Session updated for $phone - State: $state");
+    return $result;
+}
+
+function clearUserSession($conn, $phone) {
+    if (!$conn || $conn->connect_error) return false;
+    $stmt = $conn->prepare("DELETE FROM user_sessions WHERE phone = ?");
+    if (!$stmt) return false;
+    $stmt->bind_param("s", $phone);
+    $result = $stmt->execute();
+    $stmt->close();
+    error_log("Session cleared for $phone");
+    return $result;
+}
+
+// =============================================================================
+// FLOW TRIGGER / LOOKUP FUNCTIONS
+// =============================================================================
+
+function getFlowByTriggerKeyword($conn, $input) {
+    if (!$conn || $conn->connect_error) return null;
+    $input = strtolower(trim($input));
+
+    $stmt = $conn->prepare(
+        "SELECT * FROM bot_flows
+         WHERE is_active = 1
+         AND (
+             LOWER(trigger_keyword) = ?
+             OR FIND_IN_SET(?, REPLACE(LOWER(trigger_keyword), ',', ',')) > 0
+             OR LOCATE(?, LOWER(trigger_keyword)) > 0
+         )
+         LIMIT 1"
+    );
+
+    if (!$stmt) {
+        $allFlows = getAllActiveFlows($conn);
+        foreach ($allFlows as $flow) {
+            $keywords = explode(',', strtolower($flow['trigger_keyword']));
+            foreach ($keywords as $keyword) {
+                if (trim($keyword) === $input) return $flow;
+            }
+        }
+        return null;
+    }
+
+    $stmt->bind_param("sss", $input, $input, $input);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    if ($result->num_rows > 0) {
+        $flow = $result->fetch_assoc();
+        $stmt->close();
+        return $flow;
+    }
+    $stmt->close();
+    return null;
+}
+
+function getAllActiveFlows($conn) {
+    if (!$conn || $conn->connect_error) return [];
+    $stmt = $conn->prepare("SELECT * FROM bot_flows WHERE is_active = 1");
+    if (!$stmt) return [];
+    $stmt->execute();
+    $result = $stmt->get_result();
+    $flows  = [];
+    while ($row = $result->fetch_assoc()) {
+        $flows[] = $row;
+    }
+    $stmt->close();
+    return $flows;
+}
+
+// =============================================================================
+// FLOW START
+// =============================================================================
+
+function startFlow($conn, $phone, $flowId, $initialInput) {
+    if (!$conn || $conn->connect_error) return;
+
+    $stmt = $conn->prepare("SELECT flow_data FROM bot_flows WHERE id = ?");
+    if (!$stmt) return;
+    $stmt->bind_param("i", $flowId);
+    $stmt->execute();
+    $flow = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    if (!$flow) return;
+
+    $flowData = json_decode($flow['flow_data'], true);
+    if (!$flowData) return;
+
+    $nodes = $flowData['nodes'] ?? [];
+    $edges = $flowData['edges'] ?? [];
+
+    $startNode = null;
+    foreach ($nodes as $node) {
+        if ($node['type'] === 'start') { $startNode = $node; break; }
+    }
+    if (!$startNode) return;
+
+    $firstNode = null;
+    foreach ($edges as $edge) {
+        if ($edge['source'] === $startNode['id']) { $firstNode = $edge['target']; break; }
+    }
+    if (!$firstNode) return;
+
+    // Carry over variables from any existing session (e.g. meta_flow_pending)
+    $existingSession = getUserSession($conn, $phone);
+    $inheritedVars   = [];
+    if ($existingSession && !empty($existingSession['variables'])) {
+        $inheritedVars = $existingSession['variables'];
+    }
+
+    updateUserSession($conn, $phone, 'in_flow', [
+        'current_flow_id'   => $flowId,
+        'current_node_id'   => $firstNode,
+        'flow_data'         => $flowData,
+        'variables'         => array_merge($inheritedVars, ['last_input' => $initialInput]),
+        'awaiting_button'   => false,
+        'awaiting_question' => false,
+        'question_node_id'  => null,
+        'last_message_id'   => null,
+    ]);
+
+    processFlowNode($conn, $phone, $flowId, $firstNode, $initialInput, null);
+}
+
+// =============================================================================
+// HELPER: does a node have no conditions on its outgoing edges?
+// =============================================================================
+
+function nodeHasNoConditions($edges, $nodeId) {
+    $outgoing = [];
+    foreach ($edges as $edge) {
+        if ($edge['source'] === $nodeId) $outgoing[] = $edge;
+    }
+    if (empty($outgoing)) return true;
+
+    foreach ($outgoing as $edge) {
+        $cond = trim($edge['condition'] ?? $edge['data']['condition'] ?? '');
+        if ($cond !== '') return false;
+    }
+    return true;
+}
+
+// =============================================================================
+// MAIN NODE PROCESSOR
+// =============================================================================
+
+function processFlowNode(
+    $conn, $phone, $flowId, $nodeId, $userInput,
+    $session = null, $buttonId = '', $replyToId = null, $replyToText = null
+) {
+    if (!$conn || $conn->connect_error) return;
+
+    if (!$session) $session = getUserSession($conn, $phone);
+    if (!$session) return;
+
+    $flowData = $session['flow_data'];
+    if (!$flowData) return;
+
+    $nodes = $flowData['nodes'] ?? [];
+    $edges = $flowData['edges'] ?? [];
+
+    $currentNode = null;
+    foreach ($nodes as $node) {
+        if ($node['id'] === $nodeId) { $currentNode = $node; break; }
+    }
+    if (!$currentNode) {
+        error_log("Node $nodeId not found in flow $flowId");
+        return;
+    }
+
+    $variables        = $session['variables'];
+    $awaitingButton   = $session['awaiting_button']   ?? false;
+    $awaitingQuestion = $session['awaiting_question'] ?? false;
+
+    if ($replyToId) {
+        $variables['replied_to_message_id']   = $replyToId;
+        $variables['replied_to_message_text'] = $replyToText;
+    }
+
+    error_log("Processing node [{$currentNode['type']}] id=$nodeId for $phone");
+    error_log("Current variables: " . json_encode($variables));
+
+    switch ($currentNode['type']) {
+
+        // ── start ─────────────────────────────────────────────────────────────
+        case 'start':
+            $next = findNextNode($edges, $nodeId);
+            if ($next) {
+                updateUserSession($conn, $phone, 'in_flow', [
+                    'current_flow_id'   => $flowId,
+                    'current_node_id'   => $next,
+                    'flow_data'         => $flowData,
+                    'variables'         => $variables,
+                    'awaiting_button'   => false,
+                    'awaiting_question' => false,
+                    'question_node_id'  => null,
+                    'last_message_id'   => null,
+                ]);
+                processFlowNode($conn, $phone, $flowId, $next, $userInput, null);
+            }
+            break;
+
+        // ── message ───────────────────────────────────────────────────────────
+        case 'message':
+            $text = $currentNode['data']['message'] ?? '';
+            if (empty($text)) return;
+
+            foreach ($variables as $key => $value) {
+                $text = str_replace("{{" . $key . "}}", $value, $text);
+            }
+
+            $next = findNextNode($edges, $nodeId);
+
+            if ($next) {
+                $nextNodeObj = null;
+                foreach ($nodes as $n) {
+                    if ($n['id'] === $next) { $nextNodeObj = $n; break; }
+                }
+
+                $nextNeedsInput = in_array($nextNodeObj['type'] ?? '', ['question', 'template']);
+
+                updateUserSession($conn, $phone, 'in_flow', [
+                    'current_flow_id'   => $flowId,
+                    'current_node_id'   => $next,
+                    'flow_data'         => $flowData,
+                    'variables'         => $variables,
+                    'awaiting_button'   => false,
+                    'awaiting_question' => false,
+                    'question_node_id'  => null,
+                    'last_message_id'   => null,
+                ]);
+
+                sendAndLog($conn, $phone, $text);
+
+                if (!$nextNeedsInput && nodeHasNoConditions($edges, $next)) {
+                    usleep(300000);
+                    processFlowNode($conn, $phone, $flowId, $next, $userInput, null);
+                } else {
+                    processFlowNode($conn, $phone, $flowId, $next, $userInput, null);
+                }
+            } else {
+                clearUserSession($conn, $phone);
+                sendAndLog($conn, $phone, $text);
+            }
+            break;
+
+        // ── question ──────────────────────────────────────────────────────────
+        case 'question':
+            if ($awaitingQuestion) {
+                $saveAs = $currentNode['data']['save_as_variable'] ?? '';
+                if ($saveAs) {
+                    $variables[$saveAs] = $userInput;
+                    error_log("✅ Saved '$userInput' to variable '$saveAs'");
+                }
+
+                $outgoingEdges = [];
+                foreach ($edges as $edge) {
+                    if ($edge['source'] === $nodeId) {
+                        $condition       = $edge['condition'] ?? $edge['data']['condition'] ?? '';
+                        $outgoingEdges[] = ['target' => $edge['target'], 'condition' => trim($condition)];
+                    }
+                }
+
+                $hasConditions   = false;
+                $validConditions = [];
+                foreach ($outgoingEdges as $edge) {
+                    if (!empty($edge['condition'])) {
+                        $hasConditions     = true;
+                        $validConditions[] = $edge['condition'];
+                    }
+                }
+
+                $nextNodeId = null;
+                if ($hasConditions) {
+                    foreach ($outgoingEdges as $edge) {
+                        $condition = $edge['condition'];
+                        if (!empty($condition)) {
+                            if (matchUserInputSmart($userInput, $condition)) {
+                                $nextNodeId = $edge['target'];
+                                break;
+                            }
+                            if (preg_match('/user_input\s*==\s*"([^"]+)"/i', $condition, $matches)) {
+                                if (matchUserInputSmart($userInput, trim($matches[1]))) {
+                                    $nextNodeId = $edge['target'];
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (!$hasConditions && !empty($outgoingEdges)) {
+                    $nextNodeId = $outgoingEdges[0]['target'];
+                }
+
+                if ($hasConditions && !$nextNodeId) {
+                    updateUserSession($conn, $phone, 'in_flow', [
+                        'current_flow_id'   => $flowId,
+                        'current_node_id'   => $nodeId,
+                        'flow_data'         => $flowData,
+                        'variables'         => $variables,
+                        'awaiting_button'   => false,
+                        'awaiting_question' => true,
+                        'question_node_id'  => $nodeId,
+                        'last_message_id'   => null,
+                    ]);
+                    $optionsList = [];
+                    foreach ($validConditions as $opt) {
+                        $displayOpt  = preg_replace('/user_input\s*==\s*"/i', '', $opt);
+                        $displayOpt  = str_replace('"', '', $displayOpt);
+                        $optionsList[] = $displayOpt;
+                    }
+                    $errMsg = "❌ Invalid response.\n\nPlease choose a valid option:\n👉 \""
+                            . implode("\"\n👉 \"", $optionsList) . "\"\n\n"
+                            . "💡 *Commands:*\n• Type *support* - Contact our support team\n• Type *#* - Restart the conversation";
+                    sendAndLog($conn, $phone, $errMsg);
+                    return;
+                }
+
+                if ($nextNodeId) {
+                    updateUserSession($conn, $phone, 'in_flow', [
+                        'current_flow_id'   => $flowId,
+                        'current_node_id'   => $nextNodeId,
+                        'flow_data'         => $flowData,
+                        'variables'         => $variables,
+                        'awaiting_button'   => false,
+                        'awaiting_question' => false,
+                        'question_node_id'  => null,
+                        'last_message_id'   => null,
+                    ]);
+                    processFlowNode($conn, $phone, $flowId, $nextNodeId, $userInput, null);
+                    return;
+                }
+
+                clearUserSession($conn, $phone);
+                sendAndLog($conn, $phone, "Thank you!");
+                return;
+            }
+
+            $questionText = $currentNode['data']['message'] ?? 'Please answer:';
+            foreach ($variables as $key => $value) {
+                $questionText = str_replace("{{" . $key . "}}", $value, $questionText);
+            }
+            updateUserSession($conn, $phone, 'in_flow', [
+                'current_flow_id'   => $flowId,
+                'current_node_id'   => $nodeId,
+                'flow_data'         => $flowData,
+                'variables'         => $variables,
+                'awaiting_button'   => false,
+                'awaiting_question' => true,
+                'question_node_id'  => $nodeId,
+                'last_message_id'   => null,
+            ]);
+            sendAndLog($conn, $phone, $questionText);
+            break;
+
+        // ── template ──────────────────────────────────────────────────────────
+        case 'template':
+            $templateName = $currentNode['data']['template_name'] ?? null;
+            if (!$templateName) {
+                error_log("Template node missing template_name");
+                return;
+            }
+
+            $isButtonReply = $awaitingButton || (!empty($buttonId) && $awaitingButton);
+
+            if ($isButtonReply && $awaitingButton) {
+                $variables['last_button_clicked'] = $userInput;
+                $variables['button_id']           = $buttonId;
+
+                $outgoingEdges = [];
+                foreach ($edges as $edge) {
+                    if ($edge['source'] === $nodeId) {
+                        $condition       = $edge['condition'] ?? $edge['data']['condition'] ?? '';
+                        $outgoingEdges[] = ['target' => $edge['target'], 'condition' => trim($condition)];
+                    }
+                }
+
+                $hasConditions   = false;
+                $validConditions = [];
+                foreach ($outgoingEdges as $edge) {
+                    if (!empty($edge['condition'])) {
+                        $hasConditions     = true;
+                        $validConditions[] = $edge['condition'];
+                    }
+                }
+
+                $nextNodeId = null;
+                if ($hasConditions) {
+                    foreach ($outgoingEdges as $edge) {
+                        $condition = $edge['condition'];
+                        if (!empty($condition)) {
+                            if (matchUserInputSmart($userInput, $condition)) {
+                                $nextNodeId = $edge['target'];
+                                break;
+                            }
+                            if (preg_match('/user_input\s*==\s*"([^"]+)"/i', $condition, $matches)) {
+                                if (matchUserInputSmart($userInput, trim($matches[1]))) {
+                                    $nextNodeId = $edge['target'];
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (!$hasConditions && !empty($outgoingEdges)) {
+                    $nextNodeId = $outgoingEdges[0]['target'];
+                }
+
+                if ($hasConditions && !$nextNodeId) {
+                    updateUserSession($conn, $phone, 'in_flow', [
+                        'current_flow_id'   => $flowId,
+                        'current_node_id'   => $nodeId,
+                        'flow_data'         => $flowData,
+                        'variables'         => $variables,
+                        'awaiting_button'   => true,
+                        'awaiting_question' => false,
+                        'question_node_id'  => null,
+                        'last_message_id'   => null,
+                        'pending_template'  => $templateName,
+                    ]);
+                    $errMsg = "❌ Invalid option selected.\n\nPlease choose a valid option:\n👉 \""
+                            . implode("\"\n👉 \"", $validConditions) . "\"\n\n"
+                            . "💡 *Commands:*\n• Type *support* - Contact our support team\n• Type *#* - Restart the conversation";
+                    sendAndLog($conn, $phone, $errMsg);
+                    return;
+                }
+
+                if ($nextNodeId) {
+                    updateUserSession($conn, $phone, 'in_flow', [
+                        'current_flow_id'   => $flowId,
+                        'current_node_id'   => $nextNodeId,
+                        'flow_data'         => $flowData,
+                        'variables'         => $variables,
+                        'awaiting_button'   => false,
+                        'awaiting_question' => false,
+                        'question_node_id'  => null,
+                        'last_message_id'   => null,
+                    ]);
+                    processFlowNode($conn, $phone, $flowId, $nextNodeId, $userInput, null);
+                    return;
+                }
+
+                clearUserSession($conn, $phone);
+                return;
+            }
+
+            // ── First visit: send the template ─────────────────────────────────
+            $imageMediaId      = $currentNode['data']['header_image_id'] ?? null;
+            $hasImageHeader    = $currentNode['data']['has_image_header'] ?? false;
+            $templateVariables = [];
+            $templateVarsObj   = $currentNode['data']['template_variables'] ?? [];
+
+            if (!empty($templateVarsObj) && is_array($templateVarsObj)) {
+                foreach ($templateVarsObj as $varValue) {
+                    $processedValue = $varValue;
+                    foreach ($variables as $key => $val) {
+                        $processedValue = str_replace("{{" . $key . "}}", $val, $processedValue);
+                    }
+                    $templateVariables[] = $processedValue;
+                }
+            }
+
+            // ── Determine if this is a Meta Flow template ─────────────────────
+            $isFlowTemplate    = !empty($currentNode['data']['is_flow_template']);
+            $flowToken         = $currentNode['data']['flow_token']       ?? 'unused';
+            $flowActionDataRaw = $currentNode['data']['flow_action_data'] ?? [];
+
+            if ($isFlowTemplate) {
+                // Replace {{variable}} placeholders inside flow_action_data values
+                $flowActionData = [];
+                if (is_array($flowActionDataRaw)) {
+                    foreach ($flowActionDataRaw as $k => $v) {
+                        foreach ($variables as $varKey => $varVal) {
+                            $v = str_replace("{{" . $varKey . "}}", $varVal, $v);
+                        }
+                        $flowActionData[$k] = $v;
+                    }
+                }
+
+                sendTemplateFlowMessage(
+                    $phone, $templateName,
+                    $GLOBALS['TOKEN'], $GLOBALS['PHONE_ID'],
+                    $flowToken, $flowActionData
+                );
+
+            } elseif ($hasImageHeader && $imageMediaId) {
+                sendTemplateMessageWithImage(
+                    $phone, $templateName,
+                    $GLOBALS['TOKEN'], $GLOBALS['PHONE_ID'],
+                    $imageMediaId, $templateVariables
+                );
+            } else {
+                sendTemplateMessage(
+                    $phone, $templateName,
+                    $GLOBALS['TOKEN'], $GLOBALS['PHONE_ID'],
+                    [], 'en', $templateVariables
+                );
+            }
+
+            // ── Log template send to messages-new ─────────────────────────────
+            if ($conn && !$conn->connect_error) {
+                $logMsg = "[Template: $templateName]";
+                $stmt = $conn->prepare(
+                    "INSERT INTO `messages-new`
+                     (phone, message, type, direction, status, created_at)
+                     VALUES (?, ?, 'template', 'outgoing', 'sent', NOW())"
+                );
+                $stmt->bind_param("ss", $phone, $logMsg);
+                $stmt->execute();
+                $stmt->close();
+                error_log("Template send logged to DB: $templateName → $phone");
+            }
+
+            // ── Save session awaiting button/flow reply ────────────────────────
+            updateUserSession($conn, $phone, 'in_flow', [
+                'current_flow_id'   => $flowId,
+                'current_node_id'   => $nodeId,
+                'flow_data'         => $flowData,
+                'variables'         => $variables,
+                'awaiting_button'   => true,
+                'awaiting_question' => false,
+                'question_node_id'  => null,
+                'last_message_id'   => null,
+                'pending_template'  => $templateName,  // read by nfm_reply handler
+            ]);
+            break;
+
+        // ── condition ─────────────────────────────────────────────────────────
+        case 'condition':
+            $cond      = $currentNode['data']['condition'] ?? '';
+            $evaluated = evaluateCondition($cond, $userInput, $variables);
+
+            $next = null;
+            foreach ($edges as $edge) {
+                if ($edge['source'] === $nodeId) {
+                    $ec = $edge['condition'] ?? '';
+                    if (($ec === 'true' && $evaluated) || ($ec === 'false' && !$evaluated)) {
+                        $next = $edge['target'];
+                        break;
+                    } elseif (empty($ec) && !$next) {
+                        $next = $edge['target'];
+                    }
+                }
+            }
+            if ($next) {
+                updateUserSession($conn, $phone, 'in_flow', [
+                    'current_flow_id'   => $flowId,
+                    'current_node_id'   => $next,
+                    'flow_data'         => $flowData,
+                    'variables'         => $variables,
+                    'awaiting_button'   => false,
+                    'awaiting_question' => false,
+                    'question_node_id'  => null,
+                    'last_message_id'   => null,
+                ]);
+                processFlowNode($conn, $phone, $flowId, $next, $userInput, null);
+            }
+            break;
+
+        // ── variable ──────────────────────────────────────────────────────────
+        case 'variable':
+            $varName  = $currentNode['data']['variable_name'] ?? '';
+            $varValue = $currentNode['data']['variable_value'] ?? '';
+            if ($varName && $varValue) {
+                foreach ($variables as $key => $val) {
+                    $varValue = str_replace("{{" . $key . "}}", $val, $varValue);
+                }
+                $variables[$varName] = $varValue;
+            }
+            $next = findNextNode($edges, $nodeId);
+            if ($next) {
+                updateUserSession($conn, $phone, 'in_flow', [
+                    'current_flow_id'   => $flowId,
+                    'current_node_id'   => $next,
+                    'flow_data'         => $flowData,
+                    'variables'         => $variables,
+                    'awaiting_button'   => false,
+                    'awaiting_question' => false,
+                    'question_node_id'  => null,
+                    'last_message_id'   => null,
+                ]);
+                processFlowNode($conn, $phone, $flowId, $next, $userInput, null);
+            }
+            break;
+
+        // ── end ───────────────────────────────────────────────────────────────
+        case 'end':
+            clearUserSession($conn, $phone);
+            $endMessage = $currentNode['data']['message'] ?? 'Thank you! Conversation ended.';
+            foreach ($variables as $key => $value) {
+                $endMessage = str_replace("{{" . $key . "}}", $value, $endMessage);
+            }
+            sendAndLog($conn, $phone, $endMessage);
+            break;
+    }
+}
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+function findNextNode($edges, $currentNodeId) {
+    foreach ($edges as $edge) {
+        if ($edge['source'] === $currentNodeId) return $edge['target'];
+    }
+    return null;
+}
+
+function evaluateCondition($condition, $userInput, $variables) {
+    $userInput = trim($userInput);
+    $condition = trim($condition);
+
+    if (matchUserInputSmart($userInput, $condition)) return true;
+
+    if (preg_match('/user_input\s*==\s*"([^"]+)"/i', $condition, $matches)) {
+        if (matchUserInputSmart($userInput, trim($matches[1]))) return true;
+    }
+
+    if (preg_match('/user_input\s*contains\s*"([^"]+)"/i', $condition, $matches)) {
+        if (strpos(strtolower($userInput), strtolower(trim($matches[1]))) !== false) return true;
+    }
+
+    if (preg_match('/(\w+)\s*==\s*"([^"]+)"/', $condition, $matches)) {
+        $actual   = strtolower(trim($variables[$matches[1]] ?? ''));
+        $expected = strtolower(trim($matches[2]));
+        if ($actual === $expected) return true;
+    }
+
+    return false;
+}
+
+// =============================================================================
+// WHATSAPP SEND HELPERS
+// =============================================================================
+
+/**
+ * Send a template that contains a Meta Flow button.
+ * Uses stdClass() for empty flow_action_data so PHP encodes {} not [].
+ */
+function sendTemplateFlowMessage(
+    $to, $templateName, $token, $phoneId,
+    $flowToken = 'unused', $flowActionData = [], $languageCode = 'en'
+) {
+    $url = "https://graph.facebook.com/v18.0/$phoneId/messages";
+
+    $data = [
+        "messaging_product" => "whatsapp",
+        "to"                => $to,
+        "type"              => "template",
+        "template"          => [
+            "name"       => $templateName,
+            "language"   => ["code" => $languageCode],
+            "components" => [
+                [
+                    "type"     => "button",
+                    "sub_type" => "flow",
+                    "index"    => "0",
+                    "parameters" => [
+                        [
+                            "type"   => "action",
+                            "action" => [
+                                "flow_token"       => $flowToken,
+                                // empty array must encode as {} not [] — stdClass does this
+                                "flow_action_data" => (empty($flowActionData) || !is_array($flowActionData))
+                                    ? new stdClass()
+                                    : $flowActionData,
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ],
+    ];
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_HTTPHEADER,     ["Authorization: Bearer $token", "Content-Type: application/json"]);
+    curl_setopt($ch, CURLOPT_POST,           1);
+    curl_setopt($ch, CURLOPT_POSTFIELDS,     json_encode($data, JSON_UNESCAPED_UNICODE));
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT,        30);
+    $response  = curl_exec($ch);
+    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    error_log("sendTemplateFlowMessage [$templateName → $to] HTTP $http_code: $response");
+
+    $decoded = json_decode($response, true);
+    if (!empty($decoded['error'])) {
+        error_log("Meta API Error (Flow template): " . json_encode($decoded['error']));
+    }
+
+    return $decoded;
+}
+
+function sendTemplateMessageWithImage($to, $templateName, $token, $phoneId, $imageMediaId = null, $variables = [], $languageCode = 'en') {
+    $url        = "https://graph.facebook.com/v18.0/$phoneId/messages";
+    $template   = ["name" => $templateName, "language" => ["code" => $languageCode]];
+    $components = [];
+
+    if ($imageMediaId) {
+        $components[] = [
+            "type"       => "header",
+            "parameters" => [["type" => "image", "image" => ["id" => $imageMediaId]]],
+        ];
+    }
+    if (!empty($variables)) {
+        $bodyParams = [];
+        foreach ($variables as $var) {
+            if (!empty($var)) $bodyParams[] = ["type" => "text", "text" => $var];
+        }
+        if (!empty($bodyParams)) $components[] = ["type" => "body", "parameters" => $bodyParams];
+    }
+    if (!empty($components)) $template["components"] = $components;
+
+    $data = ["messaging_product" => "whatsapp", "to" => $to, "type" => "template", "template" => $template];
+    $ch   = curl_init($url);
+    curl_setopt($ch, CURLOPT_HTTPHEADER,     ["Authorization: Bearer $token", "Content-Type: application/json"]);
+    curl_setopt($ch, CURLOPT_POST,           1);
+    curl_setopt($ch, CURLOPT_POSTFIELDS,     json_encode($data));
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT,        30);
+    $response = curl_exec($ch);
+    curl_close($ch);
+    error_log("sendTemplateMessageWithImage [$templateName → $to]: " . substr($response, 0, 500));
+    return json_decode($response, true);
+}
+
+function sendTemplateMessage($to, $templateName, $token, $phoneId, $components = [], $languageCode = 'en', $variables = []) {
+    $url = "https://graph.facebook.com/v18.0/$phoneId/messages";
+    $tpl = ["name" => $templateName, "language" => ["code" => $languageCode]];
+
+    if (!empty($variables)) {
+        $bodyParams = [];
+        foreach ($variables as $var) {
+            if (!empty($var)) $bodyParams[] = ["type" => "text", "text" => $var];
+        }
+        if (!empty($bodyParams)) $components[] = ["type" => "body", "parameters" => $bodyParams];
+    }
+    if (!empty($components)) $tpl['components'] = $components;
+
+    $data = ["messaging_product" => "whatsapp", "to" => $to, "type" => "template", "template" => $tpl];
+    $ch   = curl_init($url);
+    curl_setopt($ch, CURLOPT_HTTPHEADER,     ["Authorization: Bearer $token", "Content-Type: application/json"]);
+    curl_setopt($ch, CURLOPT_POST,           1);
+    curl_setopt($ch, CURLOPT_POSTFIELDS,     json_encode($data));
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT,        30);
+    $response = curl_exec($ch);
+    curl_close($ch);
+    error_log("sendTemplateMessage [$templateName → $to]: " . substr($response, 0, 500));
+    return json_decode($response, true);
+}
+
+function sendWhatsAppMessage($to, $message, $token, $phoneId) {
+    $url  = "https://graph.facebook.com/v18.0/$phoneId/messages";
+    $data = [
+        "messaging_product" => "whatsapp",
+        "to"                => $to,
+        "type"              => "text",
+        "text"              => ["body" => $message],
+    ];
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_HTTPHEADER,     ["Authorization: Bearer $token", "Content-Type: application/json"]);
+    curl_setopt($ch, CURLOPT_POST,           1);
+    curl_setopt($ch, CURLOPT_POSTFIELDS,     json_encode($data));
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT,        30);
+    curl_exec($ch);
+    curl_close($ch);
+}
