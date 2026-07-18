@@ -156,7 +156,7 @@ function formatTemplateMessage(
   
   return {
     name: templateName,
-    language: { code: language || "en" },
+    language: { code: language || "en_US" },
     components: templateComponents
   };
 }
@@ -336,7 +336,7 @@ export async function POST(request: NextRequest) {
           messageData.type = 'template';
           const formattedTemplate = formatTemplateMessage(
             templateName,
-            "en",
+            "en_US",
             templateVariables,
             templateComponents,
             uploadedMediaId,

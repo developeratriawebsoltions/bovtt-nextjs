@@ -110,6 +110,7 @@ export default function TemplateManager() {
     if (!selectedTemplate || !sendTemplatePhone) return;
     
     setSendingTemplate(true);
+    const cleanPhone = sendTemplatePhone.replace(/\D/g, '');
     try {
       // Check if template has header component
       const headerComponent = selectedTemplate.components?.find(c => c.type === 'HEADER');
@@ -168,7 +169,7 @@ export default function TemplateManager() {
       }
       
       const requestBody: any = {
-        phone: sendTemplatePhone,
+        phone: cleanPhone,
         template_name: selectedTemplate.name,
         language: selectedTemplate.language
       };
@@ -634,7 +635,7 @@ export default function TemplateManager() {
                   type="tel"
                   value={sendTemplatePhone}
                   onChange={(e) => setSendTemplatePhone(e.target.value)}
-                  placeholder="e.g., +919004363902"
+                  placeholder="e.g., 919004363902"
                   className="w-full bg-[#111b21] text-white rounded-lg p-2 outline-none mb-3"
                 />
                 <button

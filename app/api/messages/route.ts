@@ -30,6 +30,7 @@ export async function GET(request: NextRequest) {
         phone, 
         message, 
         type, 
+        type, 
         media_url, 
         media_id, 
         local_file_path, 

@@ -26,6 +26,10 @@ export async function GET() {
       GROUP_CONCAT(m.type ORDER BY m.id DESC SEPARATOR '|||'),
       '|||', 1
     ) as last_type,
+    SUBSTRING_INDEX(
+      GROUP_CONCAT(m.type ORDER BY m.id DESC SEPARATOR '|||'),
+      '|||', 1
+    ) as last_type,
     SUM(CASE 
       WHEN m.direction = 'incoming' AND m.is_read = 0 
       THEN 1 ELSE 0 

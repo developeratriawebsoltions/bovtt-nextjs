@@ -27,8 +27,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 // ─── WhatsApp API Credentials ─────────────────────────────────────────────────
 $VERIFY_TOKEN = "bovtt_verify_token_2024";
 $TOKEN        = "EAAdFbEtPbLABRyHG1WAtzeOSsUkMlaEDIsihvd233HvX5FNRRehwo1w0yil7OcTP2AiBQpHwTcNKZAEGbeZCooBMhB29YO7qXJbOSpwkGPSsbSpy44d7EChYFKrxjf6yW6xrIfboe18pj8pXWCQar6ZATurvljCQjIK6jmfnx9JsoI6dBF712oMbs7gbnwZDZD";
-$PHONE_ID     = "1143254892206027";
-$WABA_ID      = "952420607841173";
+$PHONE_ID     = "1079336701939409";
+$WABA_ID      = "1750171806425620";
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─── Media Upload Configuration ──────────────────────────────────────────────
@@ -502,6 +502,26 @@ function processWithVisualFlow($conn, $phone, $userInput, $buttonId = '', $reply
         return startFlow($conn, $phone, $triggeredFlow['id'], $userInput);
     }
 
+    // Check bot_responses table for simple keyword → text responses
+    if ($conn && !$conn->connect_error) {
+        $inputLower = strtolower(trim($userInput));
+        $stmt = $conn->prepare(
+            "SELECT * FROM bot_responses WHERE is_active = 1 ORDER BY priority DESC, id ASC"
+        );
+        if ($stmt) {
+            $stmt->execute();
+            $botResponses = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+            $stmt->close();
+            foreach ($botResponses as $br) {
+                $kw = strtolower(trim($br['trigger_keyword']));
+                if (!empty($kw) && ($inputLower === $kw || strpos($inputLower, $kw) !== false)) {
+                    error_log("bot_responses match: '$kw' for input '$inputLower'");
+                    return $br['response_text'];
+                }
+            }
+        }
+    }
+
     return null;
 }
 
@@ -584,7 +604,9 @@ function clearUserSession($conn, $phone) {
 function getFlowByTriggerKeyword($conn, $input) {
     if (!$conn || $conn->connect_error) return null;
     $input = strtolower(trim($input));
-    $stmt  = $conn->prepare(
+
+    // 1. Exact match first
+    $stmt = $conn->prepare(
         "SELECT * FROM bot_flows WHERE LOWER(trigger_keyword) = ? AND is_active = 1 LIMIT 1"
     );
     if (!$stmt) return null;
@@ -597,6 +619,24 @@ function getFlowByTriggerKeyword($conn, $input) {
         return $flow;
     }
     $stmt->close();
+
+    // 2. Contains match — user message contains the trigger keyword
+    $stmt2 = $conn->prepare(
+        "SELECT * FROM bot_flows WHERE is_active = 1 ORDER BY LENGTH(trigger_keyword) DESC"
+    );
+    if (!$stmt2) return null;
+    $stmt2->execute();
+    $rows = $stmt2->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt2->close();
+
+    foreach ($rows as $flow) {
+        $keyword = strtolower(trim($flow['trigger_keyword']));
+        if (!empty($keyword) && strpos($input, $keyword) !== false) {
+            error_log("Trigger matched via contains: '$keyword' in '$input'");
+            return $flow;
+        }
+    }
+
     return null;
 }
 

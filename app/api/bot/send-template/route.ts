@@ -20,7 +20,7 @@ export async function POST(request: NextRequest) {
       type: 'template',
       template: {
         name: template_name,
-        language: { code: language || 'en' }
+        language: { code: language || 'en_US' }
       }
     };
 
@@ -42,7 +42,8 @@ export async function POST(request: NextRequest) {
     if (response.ok) {
       return NextResponse.json({ success: true, message_id: result.messages?.[0]?.id });
     } else {
-      return NextResponse.json({ success: false, error: result.error?.message || 'Failed to send template' }, { status: response.status });
+      console.error('META ERROR:', JSON.stringify(result, null, 2));
+      return NextResponse.json({ success: false, error: result.error?.message, code: result.error?.code, details: result }, { status: response.status });
     }
   } catch (error: any) {
     console.error('Error sending template:', error);
